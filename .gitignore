@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# walk output
+*.png
+!docs/*.png
+sheets/
+ui_walk_report_*.json
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
