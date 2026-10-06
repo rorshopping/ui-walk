@@ -21,7 +21,10 @@ scripts/
   driver_pyqt.py              in-process PyQt/Qt driver (offscreen, headless-safe)
   driver_uia.py               any Windows app via Windows UI Automation
   run_walk.py                 orchestrator: partitioned phases, retries, sheets
-  contact_sheets.py           labeled 3x3 / 2x2 stacking + index.json
+  contact_sheets.py           labeled 3x3 / 2x2 stacking + index.json (+ --dedup)
+  embeddings.py               local EmbeddingGemma client: cache + cosine + dedup
+  compare_runs.py             cross-run diff: unchanged / changed / unpaired shots
+  test_embeddings.py          unittest suite (no network, no server needed)
 references/
   judge-handoff.md            prompt templates + coordinator rules for the judges
 ```
@@ -68,7 +71,36 @@ Stack the gallery:
 
 ```bash
 python scripts/contact_sheets.py "C:/Temp/walk/*.png" --out C:/Temp/walk/sheets --grid 3x3
+
+# or drop near-duplicate states (repeated screens waste sheet cells):
+python scripts/contact_sheets.py C:/Temp/walk --dedup            # cosine >= 0.985
+python scripts/contact_sheets.py C:/Temp/walk --dedup 0.99
 ```
+
+`--dedup` embeds the shots with a local embedding server (EmbeddingGemma 2
+behind an OpenAI-compatible `/v1/embeddings` endpoint — see
+`scripts/embeddings.py` for the one-line `llama-server` start command;
+image input needs the mmproj). Vectors cache to `embeddings.jsonl` keyed by
+file + mtime, so re-runs are free. Byte-identical shots are always dropped
+by sha256 first — that fallback works with **no server**; if the endpoint is
+unreachable only the semantic pass is skipped (with a warning). Duplicates
+get no sheet cell and are annotated in `sheets/index.json`
+(`"note": "dup of 003 (0.99)"`).
+
+### Diff two runs
+
+After a fix round, compare the new walk against the baseline so only changed
+screens need re-judging:
+
+```bash
+python scripts/compare_runs.py --a C:/Temp/walk_before --b C:/Temp/walk_after
+python scripts/compare_runs.py --a old --b new --threshold 0.97
+```
+
+It pairs every run-B shot to its nearest run-A shot by cosine similarity and
+writes `compare_report.json` plus a stdout table: UNCHANGED pairs
+(score >= threshold), CHANGED pairs (re-judge these), and unpaired shots
+(removed or renumbered screens).
 
 ### `app.json` for the Qt driver
 
@@ -94,7 +126,8 @@ python scripts/contact_sheets.py "C:/Temp/walk/*.png" --out C:/Temp/walk/sheets 
 
 - `NNN_<step>.png` — full-resolution screenshots, stable ordering
 - `ui_walk_report_<phase>.json` — machine-readable per-step `{step, ok, detail, png}`
-- `sheets/sheet_NN.png` + `sheets/index.json` — contact sheets and the cell→file map
+- `sheets/sheet_NN.png` + `sheets/index.json` — contact sheets and the cell→file map (with `--dedup`: a `duplicates` list of skipped shots)
+- `compare_report.json` — cross-run pair table from `compare_runs.py`
 
 ## The two-pass review
 

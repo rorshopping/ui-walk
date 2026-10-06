@@ -47,6 +47,11 @@ screenshots into contact sheets so review agents read ~N/9 images instead of N.
    python scripts/contact_sheets.py "C:/Temp/walk/*.png" --out C:/Temp/walk/sheets --grid 3x3
    ```
 
+   Add `--dedup` (optional threshold, default 0.985) to drop near-duplicate
+   states — repeated screens are embedded locally (see `scripts/embeddings.py`
+   for the endpoint) and skipped; byte-identical shots are dropped by hash
+   even with no server. Duplicates are annotated in `sheets/index.json`.
+
    Keep sheets ≤ ~2000 px wide (vision models downscale large images).
    Rule of thumb: 3×3 for full-window shots, 2×2 when you need panel text
    roughly legible. **Triage, then zoom**: judge agents read the sheets,
@@ -63,6 +68,10 @@ screenshots into contact sheets so review agents read ~N/9 images instead of N.
 5. **Fix → re-shoot → re-judge.** The walk is deterministic (seeded, patched
    dialogs), so a re-run after fixes produces a directly comparable gallery.
    Re-run only the affected phase with `--only <phase>` when that is enough.
+   Before re-judging, diff the runs —
+   `python scripts/compare_runs.py --a <before> --b <after>` pairs shots by
+   local embeddings and lists only UNCHANGED / CHANGED / UNPAIRED, so judges
+   re-read just the changed screens (`compare_report.json` in run B's dir).
 
 ## Safety rails (both drivers)
 

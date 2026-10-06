@@ -10,9 +10,18 @@ the coordinator expands exactly those shots at full resolution.
 Usage:
   python contact_sheets.py "C:/Temp/walk/*.png" --out C:/Temp/walk/sheets
   python contact_sheets.py C:/Temp/walk --grid 2x2 --width 1800
+  python contact_sheets.py C:/Temp/walk --dedup          # drop near-dupes
+  python contact_sheets.py C:/Temp/walk --dedup 0.99
 
 Requires Pillow (pip install pillow). Writes sheets/sheet_NN.png plus
 sheets/index.json mapping (sheet, grid position) -> source filename.
+
+With --dedup [threshold] (default 0.985), near-duplicate shots (cosine >=
+threshold under the local embedding server, see embeddings.py) are dropped:
+they get no sheet cell and are annotated in index.json as "dup of NNN".
+Exact byte-identical shots are always dropped by sha256 first — that part
+works with NO server; if the endpoint is unreachable only semantic dedup
+is skipped (with a warning).
 """
 import argparse
 import glob
@@ -25,6 +34,50 @@ try:
 except ImportError:
     sys.exit("Pillow is required: pip install pillow")
 
+from embeddings import EmbedUnavailable, cosine, embed_files, file_hashes
+
+DEDUP_DEFAULT = 0.985
+
+
+def dup_note(dup, orig):
+    """Readable annotation, e.g. 'dup of 003 (0.99)' / 'dup of 003 (identical)'."""
+    n = f"{orig[dup['dup_of']]:03d}"
+    if dup["score"] is None:
+        return f"dup of {n} (identical)"
+    return f"dup of {n} ({dup['score']:.2f})"
+
+
+def dedupe(files, threshold, cache_dir, orig):
+    """Drop exact and near-duplicate shots -> (kept, dups).
+
+    Pass 1 is pure sha256: byte-identical files lose to their first
+    occurrence, no server involved. Pass 2 embeds what is left and drops
+    any shot whose cosine to the previous KEPT shot reaches threshold.
+    """
+    dups, kept, seen = [], [], {}
+    for f in files:
+        h = file_hashes([f])[f]
+        if h in seen:
+            dups.append({"file": f, "dup_of": seen[h], "score": None})
+        else:
+            seen[h] = f
+            kept.append(f)
+    try:
+        vecs = embed_files(kept, cache_dir=cache_dir)
+    except EmbedUnavailable as e:
+        print(f"WARNING: semantic dedup skipped ({e})", file=sys.stderr)
+        return kept, dups
+    survivors, prev = [], None
+    for f in kept:
+        if prev is not None:
+            score = cosine(vecs[f], vecs[prev])
+            if score >= threshold:
+                dups.append({"file": f, "dup_of": prev, "score": score})
+                continue
+        prev = f
+        survivors.append(f)
+    return survivors, dups
+
 
 def natural_key(path):
     """Sort 001_foo.png before 010_bar.png (string sort puts 10 first)."""
@@ -33,7 +86,8 @@ def natural_key(path):
             for t in re.split(r"(\d+)", os.path.basename(path))]
 
 
-def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg")):
+def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"),
+          dedup=None):
     if os.path.isdir(src):
         files = [os.path.join(src, f) for f in os.listdir(src)
                  if f.lower().endswith(exts)]
@@ -46,11 +100,26 @@ def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"))
     if not files:
         sys.exit(f"no images matched: {src}")
 
+    # stable shot numbers (1-based position in the full sorted list) so
+    # labels and dup notes keep pointing at the same PNG with or without
+    # duplicates removed
+    orig = {f: i + 1 for i, f in enumerate(files)}
+    dups = []
+    if dedup is not None:
+        files, dups = dedupe(files, dedup, out_dir, orig)
+        for d in dups:
+            print(f"  {os.path.basename(d['file'])}: {dup_note(d, orig)}")
+        print(f"dedup: {len(dups)} of {len(orig)} shots dropped "
+              f"(threshold {dedup})")
+
     os.makedirs(out_dir, exist_ok=True)
     per_sheet = cols * rows
     cell_w = sheet_width // cols
     index = {"sheet_width": sheet_width, "grid": f"{cols}x{rows}",
-             "sheets": []}
+             "sheets": [],
+             "duplicates": [{"file": os.path.basename(d["file"]),
+                             "dup_of": os.path.basename(d["dup_of"]),
+                             "note": dup_note(d, orig)} for d in dups]}
     n_sheets = 0
 
     for start in range(0, len(files), per_sheet):
@@ -73,7 +142,7 @@ def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"))
             x = c * cell_w + (cell_w - img.width) // 2
             y = r * cell_h + (cell_h - img.height) // 2
             sheet.paste(img, (x, y))
-            label = f"[{start + i + 1:03d}] {os.path.basename(f)}"
+            label = f"[{orig[f]:03d}] {os.path.basename(f)}"
             draw.rectangle([c * cell_w, r * cell_h,
                             c * cell_w + cell_w - 1, r * cell_h + 22],
                            fill=(10, 10, 12))
@@ -82,7 +151,7 @@ def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"))
             draw.rectangle([c * cell_w, r * cell_h,
                             c * cell_w + cell_w - 1,
                             r * cell_h + cell_h - 1], outline=(70, 70, 80))
-            entries.append({"cell": i + 1, "index": start + i + 1,
+            entries.append({"cell": i + 1, "index": orig[f],
                             "file": os.path.basename(f)})
 
         out_path = os.path.join(out_dir, f"sheet_{n_sheets + 1:02d}.png")
@@ -95,8 +164,11 @@ def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"))
 
     with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as fh:
         json.dump(index, fh, indent=1)
-    print(f"{n_sheets} sheets for {len(files)} shots "
-          f"({len(files) / n_sheets:.1f} shots/sheet) -> {out_dir}")
+    if n_sheets:
+        print(f"{n_sheets} sheets for {len(files)} shots "
+              f"({len(files) / n_sheets:.1f} shots/sheet) -> {out_dir}")
+    else:
+        print(f"no sheets — every shot was a duplicate -> {out_dir}")
 
 
 def main():
@@ -107,12 +179,18 @@ def main():
     ap.add_argument("--grid", default="3x3", help="cols x rows, default 3x3")
     ap.add_argument("--width", type=int, default=1920,
                     help="sheet width in px, default 1920")
+    ap.add_argument("--dedup", nargs="?", const=DEDUP_DEFAULT, type=float,
+                    default=None, metavar="THRESHOLD",
+                    help="drop near-duplicate shots (cosine >= threshold, "
+                         f"default {DEDUP_DEFAULT}); needs the local "
+                         "embedding server, exact byte-identical shots are "
+                         "dropped regardless")
     args = ap.parse_args()
     cols, rows = (int(x) for x in args.grid.lower().split("x"))
     out_dir = args.out or os.path.join(
         args.src if os.path.isdir(args.src) else os.path.dirname(args.src)
         or ".", "sheets")
-    build(args.src, out_dir, cols, rows, args.width)
+    build(args.src, out_dir, cols, rows, args.width, dedup=args.dedup)
 
 
 if __name__ == "__main__":
