@@ -51,6 +51,9 @@ screenshots into contact sheets so review agents read ~N/9 images instead of N.
    states — repeated screens are embedded locally (see `scripts/embeddings.py`
    for the endpoint) and skipped; byte-identical shots are dropped by hash
    even with no server. Duplicates are annotated in `sheets/index.json`.
+   `--start-server` (also on `compare_runs.py`) makes the tool manage the
+   embedding server's lifecycle itself — start before the run, stop after —
+   and leaves a server that was already running alone.
 
    Keep sheets ≤ ~2000 px wide (vision models downscale large images).
    Rule of thumb: 3×3 for full-window shots, 2×2 when you need panel text

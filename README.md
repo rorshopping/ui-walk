@@ -87,6 +87,10 @@ unreachable only the semantic pass is skipped (with a warning). Duplicates
 get no sheet cell and are annotated in `sheets/index.json`
 (`"note": "dup of 003 (0.99)"`).
 
+`--start-server` (on both `contact_sheets.py` and `compare_runs.py`) makes
+the tool manage the embedding server's lifecycle itself — start before the
+run, stop after — leaving a server that was already running alone.
+
 ### Diff two runs
 
 After a fix round, compare the new walk against the baseline so only changed

@@ -12,6 +12,7 @@ Usage:
   python contact_sheets.py C:/Temp/walk --grid 2x2 --width 1800
   python contact_sheets.py C:/Temp/walk --dedup          # drop near-dupes
   python contact_sheets.py C:/Temp/walk --dedup 0.99
+  python contact_sheets.py C:/Temp/walk --dedup --start-server
 
 Requires Pillow (pip install pillow). Writes sheets/sheet_NN.png plus
 sheets/index.json mapping (sheet, grid position) -> source filename.
@@ -21,20 +22,24 @@ threshold under the local embedding server, see embeddings.py) are dropped:
 they get no sheet cell and are annotated in index.json as "dup of NNN".
 Exact byte-identical shots are always dropped by sha256 first — that part
 works with NO server; if the endpoint is unreachable only semantic dedup
-is skipped (with a warning).
+is skipped (with a warning). --start-server makes the tool manage the
+server's lifecycle itself: start before dedup, stop after; a server that
+was already running is left alone.
 """
 import argparse
 import glob
 import json
 import os
 import sys
+from contextlib import nullcontext
 
 try:
     from PIL import Image, ImageDraw
 except ImportError:
     sys.exit("Pillow is required: pip install pillow")
 
-from embeddings import EmbedUnavailable, cosine, embed_files, file_hashes
+from embeddings import (EmbedUnavailable, cosine, embed_files,
+                        embedding_server, file_hashes)
 
 DEDUP_DEFAULT = 0.985
 
@@ -87,7 +92,7 @@ def natural_key(path):
 
 
 def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"),
-          dedup=None):
+          dedup=None, start_server=False):
     if os.path.isdir(src):
         files = [os.path.join(src, f) for f in os.listdir(src)
                  if f.lower().endswith(exts)]
@@ -106,7 +111,11 @@ def build(src, out_dir, cols, rows, sheet_width, exts=(".png", ".jpg", ".jpeg"),
     orig = {f: i + 1 for i, f in enumerate(files)}
     dups = []
     if dedup is not None:
-        files, dups = dedupe(files, dedup, out_dir, orig)
+        # --start-server owns the server's lifecycle: start before dedup,
+        # stop after (always, also on error); pre-existing servers are
+        # left alone — that is embedding_server()'s None-yield contract
+        with embedding_server() if start_server else nullcontext():
+            files, dups = dedupe(files, dedup, out_dir, orig)
         for d in dups:
             print(f"  {os.path.basename(d['file'])}: {dup_note(d, orig)}")
         print(f"dedup: {len(dups)} of {len(orig)} shots dropped "
@@ -185,12 +194,17 @@ def main():
                          f"default {DEDUP_DEFAULT}); needs the local "
                          "embedding server, exact byte-identical shots are "
                          "dropped regardless")
+    ap.add_argument("--start-server", action="store_true",
+                    help="with --dedup: start the local embedding server "
+                         "before the run and stop it afterwards; a server "
+                         "that is already running is left alone")
     args = ap.parse_args()
     cols, rows = (int(x) for x in args.grid.lower().split("x"))
     out_dir = args.out or os.path.join(
         args.src if os.path.isdir(args.src) else os.path.dirname(args.src)
         or ".", "sheets")
-    build(args.src, out_dir, cols, rows, args.width, dedup=args.dedup)
+    build(args.src, out_dir, cols, rows, args.width, dedup=args.dedup,
+          start_server=args.start_server)
 
 
 if __name__ == "__main__":

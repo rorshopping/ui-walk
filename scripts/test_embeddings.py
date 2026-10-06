@@ -1,15 +1,19 @@
 """Unit tests for embeddings.py, compare_runs.py and the sheet dedup path.
 
-NO network and NO embedding server: every endpoint call goes through
-embeddings._post, which these tests replace with a fake. Run:
+NO network and NO real embedding server: every endpoint call goes through
+embeddings._post, which these tests replace with a fake, and the server
+lifecycle tests probe only an in-process 127.0.0.1 TCP listener while
+faking the spawn. Run:
 
   python -m unittest test_embeddings -v     # from scripts/
   python -m unittest discover -s scripts    # from the repo root
 """
 import json
 import os
+import socket
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -194,6 +198,171 @@ class PairingTest(unittest.TestCase):
             _write(os.path.join(d, name), b"x")
         self.assertEqual([os.path.basename(p) for p in compare_runs.shots(d)],
                          ["001_first.png", "002_early.png", "010_late.png"])
+
+
+class FakeProc:
+    """Minimal Popen stand-in: records terminate/wait, spawns nothing."""
+
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+        self.waits = 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        return 0
+
+
+class ServerLifecycleTest(unittest.TestCase):
+    """ensure_server / stop_server / embedding_server.
+
+    Endpoint probing is REAL (an in-process 127.0.0.1 TCP listener); the
+    spawn is FAKED via embeddings.subprocess.Popen — no llama-server and
+    no long polls (tiny timeouts throughout).
+    """
+
+    def setUp(self):
+        self._orig_url = os.environ.get("UIWALK_EMBED_URL")
+        self._orig_popen = embeddings.subprocess.Popen
+        self.listeners = []
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._orig_url is None:
+            os.environ.pop("UIWALK_EMBED_URL", None)
+        else:
+            os.environ["UIWALK_EMBED_URL"] = self._orig_url
+        embeddings.subprocess.Popen = self._orig_popen
+        for s in self.listeners:
+            s.close()
+
+    def _free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()  # released: connections are refused until someone listens
+        return port
+
+    def _listen(self, port):
+        s = socket.socket()
+        s.bind(("127.0.0.1", port))
+        s.listen(16)
+        # a probe that connects and hangs up still occupies the backlog;
+        # without a drain, Windows starts refusing after a few probes
+        def drain():
+            try:
+                while True:
+                    conn, _ = s.accept()
+                    conn.close()
+            except OSError:
+                pass  # listener closed in cleanup — done
+        threading.Thread(target=drain, daemon=True).start()
+        self.listeners.append(s)
+        return s
+
+    def _point_url(self, port):
+        os.environ["UIWALK_EMBED_URL"] = f"http://127.0.0.1:{port}/v1/embeddings"
+
+    def _install_popen(self, on_spawn=None):
+        """Swap in a fake Popen; returns (recorded calls, the proc it yields)."""
+        calls = []
+        proc = FakeProc()
+
+        def fake_popen(cmd, **kwargs):
+            calls.append((list(cmd), kwargs))
+            if on_spawn is not None:
+                on_spawn(cmd, kwargs)
+            return proc
+
+        embeddings.subprocess.Popen = fake_popen
+        return calls, proc
+
+    def test_already_running_returns_none_and_never_spawns(self):
+        port = self._free_port()
+        self._listen(port)  # real listener: the endpoint answers (TCP-wise)
+        self._point_url(port)
+        calls, _ = self._install_popen()
+        self.assertIsNone(embeddings.ensure_server(timeout=2))
+        self.assertEqual(calls, [])  # "already running — don't touch it"
+        with embeddings.embedding_server(timeout=2) as proc:
+            self.assertIsNone(proc)
+        self.assertEqual(calls, [])
+
+    def test_spawns_when_down_and_reports_ready(self):
+        port = self._free_port()  # nothing listening: ensure_server spawns
+        self._point_url(port)
+        calls, proc = self._install_popen(
+            on_spawn=lambda cmd, kw:
+                self._listen(int(cmd[cmd.index("--port") + 1])))
+        got = embeddings.ensure_server(timeout=10)
+        self.assertIs(got, proc)
+        cmd, kwargs = calls[0]
+        self.assertEqual(cmd[:2], ["llama-server", "-hf"])
+        self.assertEqual(cmd[3:], ["--embeddings", "--port", str(port)])
+        if os.name == "nt":
+            self.assertEqual(kwargs.get("creationflags"), 0x08000000)
+
+    def test_context_manager_stops_what_it_started(self):
+        port = self._free_port()
+        self._point_url(port)
+        calls, proc = self._install_popen(
+            on_spawn=lambda cmd, kw:
+                self._listen(int(cmd[cmd.index("--port") + 1])))
+        with embeddings.embedding_server(timeout=10) as started:
+            self.assertIs(started, proc)  # yields only what it started
+            self.assertEqual(len(calls), 1)
+        self.assertTrue(proc.terminated)  # stopped exactly once on exit
+        self.assertEqual(proc.waits, 1)
+
+    def test_context_manager_leaves_preexisting_server_alone(self):
+        port = self._free_port()
+        self._listen(port)
+        self._point_url(port)
+        _, proc = self._install_popen()
+        with embeddings.embedding_server(timeout=2) as started:
+            self.assertIsNone(started)
+        self.assertFalse(proc.terminated)  # nothing was spawned or stopped
+
+    def test_spawn_failure_raises_with_install_hint(self):
+        port = self._free_port()
+        self._point_url(port)
+
+        def missing_exe(cmd, kwargs):
+            raise FileNotFoundError(2, "The system cannot find the file")
+
+        self._install_popen(on_spawn=missing_exe)
+        with self.assertRaises(embeddings.EmbedUnavailable) as cm:
+            embeddings.ensure_server(timeout=5)
+        msg = str(cm.exception)
+        self.assertIn("llama-server", msg)
+        self.assertIn("winget", msg)
+
+    def test_timeout_stops_process_and_raises(self):
+        port = self._free_port()
+        self._point_url(port)
+        msgs = []
+        _, proc = self._install_popen()  # spawns, but never listens
+        with self.assertRaises(embeddings.EmbedUnavailable) as cm:
+            embeddings.ensure_server(timeout=1.5, progress=msgs.append)
+        self.assertIn(f"127.0.0.1:{port}", str(cm.exception))
+        self.assertTrue(proc.terminated)  # no orphaned process on timeout
+        self.assertTrue(msgs and msgs[0].startswith(
+            "waiting for embedding server"))
+
+    def test_stop_server_is_none_safe(self):
+        embeddings.stop_server(None)  # must not raise
+
+    def test_stop_server_terminates_and_waits(self):
+        p = FakeProc()
+        embeddings.stop_server(p)
+        self.assertTrue(p.terminated)
+        self.assertEqual(p.waits, 1)
 
 
 if __name__ == "__main__":

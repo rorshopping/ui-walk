@@ -12,16 +12,27 @@ shots never re-embed. Byte-identical files are embedded once and share a
 vector — that part needs no server at all.
 
 Env:
-  UIWALK_EMBED_URL    default http://127.0.0.1:8091/v1/embeddings
-  UIWALK_EMBED_MODEL  default embeddinggemma-2
+  UIWALK_EMBED_URL          default http://127.0.0.1:8091/v1/embeddings
+  UIWALK_EMBED_MODEL        default embeddinggemma-2
+  UIWALK_EMBED_SERVER_EXE   default llama-server (what ensure_server spawns)
+  UIWALK_EMBED_SERVER_REPO  default ggml-org/embeddinggemma-2-GGUF
+
+ensure_server()/embedding_server() can also manage that server's lifecycle:
+start it before a run, stop it afterwards — a server that was already
+answering is left alone.
 """
 import base64
 import hashlib
 import json
 import mimetypes
 import os
+import socket
+import subprocess
+import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from urllib.parse import urlparse
 
 DEFAULT_URL = "http://127.0.0.1:8091/v1/embeddings"
 DEFAULT_MODEL = "embeddinggemma-2"
@@ -180,3 +191,106 @@ def embed_files(paths, cache_dir=None, batch=BATCH):
         cache[p] = (vecs[p], os.path.getmtime(p))
     _save_cache(cache_dir, cache)
     return vecs
+
+
+# ---------------------------------------------------------------------------
+# server lifecycle — the tools' --start-server flag runs on these
+# ---------------------------------------------------------------------------
+
+CREATE_NO_WINDOW = 0x08000000  # Windows: keep the spawned console hidden
+
+
+def _endpoint_host_port(url=None):
+    """host, port of the embeddings endpoint (scheme default when no port)."""
+    u = urlparse(url or embed_url())
+    port = u.port or (443 if u.scheme == "https" else 80)
+    return u.hostname or "127.0.0.1", port
+
+
+def _tcp_alive(host, port, timeout=1.0):
+    """Cheap readiness probe: does a plain TCP connect succeed?"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def server_command(exe=None, repo=None, port=None):
+    """The llama-server spawn line (list) from env defaults + endpoint port."""
+    exe = exe or os.environ.get("UIWALK_EMBED_SERVER_EXE", "llama-server")
+    repo = repo or os.environ.get("UIWALK_EMBED_SERVER_REPO",
+                                  "ggml-org/embeddinggemma-2-GGUF")
+    if port is None:
+        port = _endpoint_host_port()[1]
+    return [exe, "-hf", repo, "--embeddings", "--port", str(port)]
+
+
+def ensure_server(timeout=600, progress=print):
+    """Start the local embedding server unless one is already answering.
+
+    A plain TCP connect to the endpoint's host:port decides: if something
+    answers, return None ("already running, don't touch it"). Otherwise
+    spawn `llama-server -hf <repo> --embeddings --port <port>` and poll the
+    endpoint until it answers or `timeout` expires (the first start
+    downloads the model, ~310 MB, hence the generous default). Returns the
+    subprocess for stop_server()/embedding_server() — the caller owns
+    stopping it.
+    """
+    host, port = _endpoint_host_port()
+    if _tcp_alive(host, port):
+        return None
+    cmd = server_command(port=port)
+    kwargs = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except FileNotFoundError as e:
+        raise EmbedUnavailable(
+            f"embedding server executable not found: {cmd[0]} — install it "
+            f"with `winget install ggml.llamacpp`, put llama-server on PATH, "
+            f"or point UIWALK_EMBED_SERVER_EXE at the exe") from e
+    start = time.monotonic()
+    deadline = start + timeout
+    announced = start - 5.0  # fire the first progress message immediately
+    while True:
+        if _tcp_alive(host, port):
+            return proc
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        if now - announced >= 5.0:
+            announced = now
+            progress(f"waiting for embedding server… {now - start:.0f}s")
+        time.sleep(0.5)
+    stop_server(proc)
+    raise EmbedUnavailable(
+        f"embedding server did not answer {host}:{port} within {timeout}s "
+        f"(started as: {' '.join(cmd)})")
+
+
+def stop_server(proc):
+    """Terminate a server we started; safe to call with None."""
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+@contextmanager
+def embedding_server(timeout=600, progress=print):
+    """Run a block with the embedding endpoint reachable.
+
+    Starts the server only if nothing is answering yet. The yielded value
+    is the Popen we started, or None for a pre-existing server — which is
+    never touched and never stopped. Whatever we started is stopped on
+    exit, including on error.
+    """
+    proc = ensure_server(timeout=timeout, progress=progress)
+    try:
+        yield proc
+    finally:
+        stop_server(proc)

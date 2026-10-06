@@ -8,6 +8,7 @@ only changed screens need re-judging after a fix round.
 Usage:
   python compare_runs.py --a C:/Temp/walk_before --b C:/Temp/walk_after
   python compare_runs.py --a old --b new --threshold 0.97
+  python compare_runs.py --a old --b new --start-server
 
 Writes compare_report.json (default: into run B's dir, override with --out)
 and prints a table: UNCHANGED rows (score >= threshold), CHANGED rows
@@ -15,14 +16,18 @@ and prints a table: UNCHANGED rows (score >= threshold), CHANGED rows
 
 Requires the local embedding endpoint (see embeddings.py for the one-liner);
 vectors are cached per run dir, so repeated compares cost nothing.
+--start-server makes the tool manage the server's lifecycle itself: start
+before the compare, stop after; a server that was already running is left
+alone.
 """
 import argparse
 import json
 import os
 import re
 import sys
+from contextlib import nullcontext
 
-from embeddings import EmbedUnavailable, cosine, embed_files
+from embeddings import EmbedUnavailable, cosine, embed_files, embedding_server
 
 
 def natural_key(path):
@@ -81,16 +86,21 @@ def main():
                          "(default 0.97)")
     ap.add_argument("--out", default=None,
                     help="report path (default: <b>/compare_report.json)")
+    ap.add_argument("--start-server", action="store_true",
+                    help="start the local embedding server before the run "
+                         "and stop it afterwards; a server that is already "
+                         "running is left alone")
     args = ap.parse_args()
 
     keys_a, keys_b = shots(args.a), shots(args.b)
     if not keys_a and not keys_b:
         sys.exit("both runs are empty — nothing to compare")
-    try:
-        vecs_a = embed_files(keys_a, cache_dir=args.a)
-        vecs_b = embed_files(keys_b, cache_dir=args.b)
-    except EmbedUnavailable as e:
-        sys.exit(str(e))
+    with embedding_server() if args.start_server else nullcontext():
+        try:
+            vecs_a = embed_files(keys_a, cache_dir=args.a)
+            vecs_b = embed_files(keys_b, cache_dir=args.b)
+        except EmbedUnavailable as e:
+            sys.exit(str(e))
 
     pairs, unpaired_a = pair_shots(keys_a, vecs_a, keys_b, vecs_b)
     unpaired_b = [j for j in range(len(keys_b))
